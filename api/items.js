@@ -29,6 +29,7 @@ export async function POST(request) {
         image: String(item.image || ''),
         sound: String(item.sound || ''),
         soundName: String(item.soundName || '').slice(0, 120),
+        autoImage: !!item.autoImage,
         volume: Math.min(2, Math.max(0, Number.isFinite(+item.volume) ? +item.volume : 1)),
       };
       await put(`items/${item.id}-${Date.now()}.json`, JSON.stringify(clean), {

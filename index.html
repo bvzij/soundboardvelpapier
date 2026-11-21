@@ -97,6 +97,8 @@
   .field { margin-top: 16px; }
   .field > .lbl { display: block; font-size: 14px; color: var(--muted); margin-bottom: 6px; }
   .soundrow { display: flex; gap: 8px; align-items: center; }
+  #recBtn.rec { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .soundrow { flex-wrap: wrap; }
   .soundrow .name { flex: 1; min-width: 0; color: var(--muted); font-size: 14px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   input[type=text] {
@@ -157,14 +159,15 @@
 
   <button type="button" class="pick" id="imgPick">
     <img id="imgPreview" alt="">
-    <span>Tap to choose a picture</span>
+    <span>Tap to choose a picture<br><small>Optional — leave empty to use the label's initials</small></span>
   </button>
   <input type="file" id="imgInput" accept="image/*" hidden>
 
   <div class="field">
     <span class="lbl">Sound</span>
     <div class="soundrow">
-      <button type="button" class="btn" id="soundBtn">Choose sound</button>
+      <button type="button" class="btn" id="soundBtn">Choose file</button>
+      <button type="button" class="btn" id="recBtn">● Record</button>
       <button type="button" class="btn" id="previewBtn" disabled>▶</button>
       <span class="name" id="soundName">No file chosen</span>
     </div>
@@ -223,7 +226,7 @@
 
   const MAX_BYTES = 4.3 * 1024 * 1024;
   const EXT_TYPES = { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav',
-    ogg: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac', webp: 'image/webp',
+    ogg: 'audio/ogg', opus: 'audio/ogg', webm: 'audio/webm', flac: 'audio/flac', webp: 'image/webp',
     jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif' };
   async function uploadFile(blob, name) {
     if (blob.size > MAX_BYTES) throw new Error('File too big (max 4 MB)');
@@ -423,6 +426,7 @@
   }
 
   function closeEditor() {
+    stopRecording(true);
     stop();
     localUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
     setImagePreview(null);
@@ -469,19 +473,95 @@
 
   soundBtn.addEventListener('click', () => soundInput.click());
   soundInput.addEventListener('change', () => { if (soundInput.files[0]) takeSound(soundInput.files[0]); });
-  function takeSound(f) {
+  function takeSound(f, isRecording) {
     if (f.size > MAX_BYTES) { toast('Sound too big (max 4 MB)'); soundInput.value = ''; return; }
     pending.sound = f;
     pending.soundName = f.name;
     soundName.textContent = f.name;
     previewBtn.disabled = false;
-    if (!labelInput.value.trim() && !current) {
+    if (!isRecording && !labelInput.value.trim() && !current) {
       labelInput.value = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 40);
     }
  }
 
+  // ---------- Microphone recording ----------
+  const recBtn = $('recBtn');
+  let rec = null;   // { recorder, stream, timer, start }
+  const MAX_REC_SECONDS = 60;
+  function stopRecording(discard) {
+    if (!rec) return;
+    rec.discard = !!discard;
+    clearInterval(rec.timer);
+    if (rec.recorder.state !== 'inactive') rec.recorder.stop();
+  }
+  recBtn.addEventListener('click', async () => {
+    if (rec) { stopRecording(); return; }
+    if (!navigator.mediaDevices || !window.MediaRecorder) { toast('Recording is not supported in this browser'); return; }
+    stop();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      toast('Microphone not allowed — check the browser permission', 4000);
+      return;
+    }
+    const type = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg']
+      .find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
+    const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      const discard = rec && rec.discard;
+      rec = null;
+      recBtn.classList.remove('rec');
+      recBtn.textContent = '● Record';
+      if (discard || !chunks.length) return;
+      const mime = (recorder.mimeType || type || 'audio/webm').split(';')[0];
+      const ext = mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm';
+      const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '-');
+      const file = new File(chunks, `recording-${stamp}.${ext}`, { type: mime });
+      takeSound(file, true);
+    };
+    rec = { recorder, stream, start: Date.now() };
+    recorder.start();
+    recBtn.classList.add('rec');
+    const tick = () => {
+      const sec = Math.floor((Date.now() - rec.start) / 1000);
+      recBtn.textContent = `■ Stop ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+      if (sec >= MAX_REC_SECONDS) stopRecording();
+    };
+    tick();
+    rec.timer = setInterval(tick, 250);
+  });
+
+  // ---------- Initials picture (when no picture is chosen) ----------
+  function initialsOf(label) {
+    const words = label.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '?';
+    const s = words.length === 1 ? [...words[0]].slice(0, 2).join('') : [...words[0]][0] + [...words[1]][0];
+    return s.toUpperCase();
+  }
+  function initialsImage(label) {
+    const size = 512;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    let h = 0;
+    for (const ch of label) h = (h * 31 + ch.codePointAt(0)) % 360;
+    g.fillStyle = `hsl(${h}, 62%, 42%)`;
+    g.fillRect(0, 0, size, size);
+    const text = initialsOf(label);
+    g.fillStyle = '#fff';
+    g.font = `800 ${text.length > 1 ? 220 : 260}px system-ui, -apple-system, Roboto, sans-serif`;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(text, size / 2, size / 2 + 12);
+    return new Promise(r => c.toBlob(r, 'image/webp', 0.9));
+  }
+
   // Drag & drop pictures and sounds onto the dialog
-  const isAudio = f => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|wav|ogg|opus|flac)$/i.test(f.name);
+  const isAudio = f => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|wav|ogg|opus|flac|webm)$/i.test(f.name);
   const isImage = f => /^image\//.test(f.type);
   ['dragenter', 'dragover'].forEach(e => dlg.addEventListener(e, ev => {
     ev.preventDefault(); dlg.classList.add('drag');
@@ -518,8 +598,20 @@
   $('cancelBtn').addEventListener('click', closeEditor);
 
   saveBtn.addEventListener('click', async () => {
-    if (!pending.image && !(current && current.image)) { toast('Choose a picture first'); return; }
-    if (!pending.sound && !(current && current.sound)) { toast('Choose a sound first'); return; }
+    if (rec) { toast('Stop the recording first'); return; }
+    if (!pending.sound && !(current && current.sound)) { toast('Choose or record a sound first'); return; }
+    const label = labelInput.value.trim();
+    const hasOwnPicture = pending.image || (current && current.image && !current.autoImage);
+    const labelChanged = current && label !== (current.label || '');
+    let autoImage = false;
+    if (!hasOwnPicture) {
+      if (!label) { toast('Add a picture or a label'); return; }
+      autoImage = true;
+      if (!current || !current.image || labelChanged) {
+        pending.image = await initialsImage(label);
+        pending.imageName = 'initials.webp';
+      }
+    }
     setBusy(true, 'Uploading…');
     try {
       const [image, sound] = await Promise.all([
@@ -533,6 +625,7 @@
         image, sound,
         soundName: pending.soundName || (current && current.soundName) || '',
         volume: current ? vol(current) : 1,
+        autoImage,
         label: labelInput.value.trim(),
       };
       await saveItems(item);
