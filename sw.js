@@ -1,6 +1,6 @@
 // Keeps the app working offline. Always tries the network first,
 // so updates you deploy on Vercel show up right away.
-const CACHE = 'soundboard-v5';
+const CACHE = 'soundboard-v6';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

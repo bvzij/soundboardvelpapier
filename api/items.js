@@ -30,6 +30,8 @@ export async function POST(request) {
         sound: String(item.sound || ''),
         soundName: String(item.soundName || '').slice(0, 120),
         autoImage: !!item.autoImage,
+        trimStart: Number.isFinite(+item.trimStart) && item.trimStart !== null && +item.trimStart > 0 ? +item.trimStart : null,
+        trimEnd: Number.isFinite(+item.trimEnd) && item.trimEnd !== null && +item.trimEnd > 0 ? +item.trimEnd : null,
         volume: Math.min(4, Math.max(0, Number.isFinite(+item.volume) ? +item.volume : 1)),
       };
       await put(`items/${item.id}-${Date.now()}.json`, JSON.stringify(clean), {

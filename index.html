@@ -45,7 +45,7 @@
 
   #grid {
     display: grid; gap: 14px; padding: 16px;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(var(--tile, 150px), 1fr));
   }
   .tile {
     position: relative; display: flex; flex-direction: column;
@@ -128,6 +128,27 @@
   .vrow input[type=range] { flex: 1; accent-color: var(--accent); height: 32px; }
   .vrow .btn { padding: 6px 12px; min-height: 36px; }
   #volList { max-height: 60vh; overflow-y: auto; }
+  .size { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .size input { width: 110px; accent-color: var(--accent); }
+  header { flex-wrap: wrap; }
+  .trim { position: relative; height: 84px; margin-top: 10px; border-radius: 12px; overflow: hidden;
+    background: var(--bg); border: 1px solid var(--line); touch-action: none; }
+  .trim canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .trim input[type=range] {
+    position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+    -webkit-appearance: none; appearance: none; background: transparent; pointer-events: none;
+  }
+  .trim input[type=range]::-webkit-slider-runnable-track { background: transparent; height: 100%; }
+  .trim input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; pointer-events: auto; width: 22px; height: 84px;
+    background: var(--accent); border-radius: 6px; cursor: ew-resize;
+  }
+  .trim input[type=range]::-moz-range-thumb {
+    pointer-events: auto; width: 22px; height: 84px; border: 0;
+    background: var(--accent); border-radius: 6px; cursor: ew-resize;
+  }
+  .triminfo { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .triminfo button { background: none; border: 0; color: var(--accent); font-weight: 600; padding: 0; }
   #toast {
     position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom));
     transform: translateX(-50%) translateY(20px); opacity: 0; pointer-events: none;
@@ -141,6 +162,7 @@
 
 <header>
   <h1>Soundboard</h1>
+  <label class="size">▪<input type="range" id="sizeRange" min="90" max="320" step="10" aria-label="Tile size">■</label>
   <div class="actions">
     <button class="btn" id="volBtn" aria-label="Volume settings">⚙ Volume</button>
     <button class="btn" id="editBtn">Edit</button>
@@ -170,6 +192,14 @@
       <button type="button" class="btn" id="recBtn">● Record</button>
       <button type="button" class="btn" id="previewBtn" disabled>▶</button>
       <span class="name" id="soundName">No file chosen</span>
+    </div>
+    <div id="trimBox" hidden>
+      <div class="trim">
+        <canvas id="trimCanvas"></canvas>
+        <input type="range" id="trimStart" min="0" max="1000" value="0" aria-label="Trim start">
+        <input type="range" id="trimEnd" min="0" max="1000" value="1000" aria-label="Trim end">
+      </div>
+      <div class="triminfo"><span id="trimInfo"></span><button type="button" id="trimReset">Reset trim</button></div>
     </div>
     <input type="file" id="soundInput" accept="audio/*,.mp3,.m4a,.wav,.ogg,.aac,.opus,.flac" hidden>
   </div>
@@ -336,7 +366,7 @@
     fallback.pause();
   }
 
-  async function playUrl(url, volume, id) {
+  async function playUrl(url, volume, id, trim) {
     stopSource();
     playingId = id;
     markPlaying();
@@ -352,17 +382,19 @@
       src.onended = () => { if (current_src === src) { current_src = null; playingId = null; markPlaying(); } };
       stopSource();
       current_src = src;
-      src.start();
+      const t0 = Math.max(0, (trim && trim.trimStart) || 0);
+      const t1 = Math.min(loaded.buf.duration, (trim && trim.trimEnd) || loaded.buf.duration);
+      if (t1 > t0) src.start(0, t0, t1 - t0); else src.start();
     } else {
       fallback.src = url;
       fallback.volume = Math.min(1, volume);
-      fallback.currentTime = 0;
+      fallback.currentTime = (trim && trim.trimStart) || 0;
       fallback.play().catch(() => { playingId = null; markPlaying(); toast("This sound can't be played"); });
     }
   }
 
   // Every tap restarts the sound from the beginning
-  const play = item => playUrl(item.sound, vol(item), item.id);
+  const play = item => playUrl(item.sound, vol(item), item.id, item);
 
   function stop() {
     stopSource();
@@ -448,10 +480,13 @@
     }
     imgInput.value = ''; soundInput.value = '';
     setBusy(false);
+    trimToken++; trimBox.hidden = true; trimBuf = null;
     dlg.showModal();
+    if (item && item.sound) setupTrim(item.sound, item.trimStart, item.trimEnd);
   }
 
   function closeEditor() {
+    trimToken++; trimBuf = null; trimBox.hidden = true;
     stopRecording(true);
     stop();
     localUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
@@ -497,6 +532,85 @@
   }
   imgInput.addEventListener('change', () => { if (imgInput.files[0]) takeImage(imgInput.files[0]); });
 
+  // ---------- Trim pad ----------
+  const trimBox = $('trimBox'), trimCanvas = $('trimCanvas');
+  const tS = $('trimStart'), tE = $('trimEnd'), trimInfo = $('trimInfo');
+  let trimBuf = null, trimToken = 0, trimPeaks = null;
+  const MIN_GAP = 20; // 2% of the length
+
+  async function setupTrim(src, start, end) {
+    const token = ++trimToken;
+    trimBox.hidden = true; trimBuf = null; trimPeaks = null;
+    let buf = null;
+    try {
+      if (src instanceof Blob) buf = await audioCtx().decodeAudioData(await src.arrayBuffer());
+      else { const l = await loadBuffer(src); buf = l && l.buf; }
+    } catch {}
+    if (!buf || token !== trimToken || !dlg.open) return;
+    trimBuf = buf;
+    const d = buf.duration;
+    tS.value = start ? Math.round(Math.min(1, start / d) * 1000) : 0;
+    tE.value = end ? Math.round(Math.min(1, end / d) * 1000) : 1000;
+    trimBox.hidden = false;
+    trimPeaks = null;
+    requestAnimationFrame(drawTrim);
+  }
+
+  function computePeaks(cols) {
+    const ch = trimBuf.getChannelData(0);
+    const step = Math.max(1, Math.floor(ch.length / cols));
+    const out = new Float32Array(cols);
+    let max = 0;
+    for (let x = 0; x < cols; x++) {
+      let p = 0;
+      const from = x * step, to = Math.min(ch.length, from + step);
+      for (let i = from; i < to; i += 4) { const v = Math.abs(ch[i]); if (v > p) p = v; }
+      out[x] = p; if (p > max) max = p;
+    }
+    if (max > 0) for (let x = 0; x < cols; x++) out[x] /= max;
+    return out;
+  }
+
+  function drawTrim() {
+    if (!trimBuf) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = trimCanvas.clientWidth, h = trimCanvas.clientHeight;
+    if (!w) return;
+    if (trimCanvas.width !== Math.round(w * dpr)) { trimCanvas.width = Math.round(w * dpr); trimCanvas.height = Math.round(h * dpr); trimPeaks = null; }
+    const g = trimCanvas.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const cols = Math.floor(w / 3);
+    if (!trimPeaks || trimPeaks.length !== cols) trimPeaks = computePeaks(cols);
+    const a = (+tS.value / 1000) * w, b = (+tE.value / 1000) * w;
+    for (let x = 0; x < cols; x++) {
+      const px = x * 3, bh = Math.max(2, trimPeaks[x] * (h - 16));
+      g.fillStyle = px >= a && px <= b ? '#ffb020' : '#4a505c';
+      g.fillRect(px, (h - bh) / 2, 2, bh);
+    }
+    g.fillStyle = 'rgba(0,0,0,.45)';
+    g.fillRect(0, 0, a, h);
+    g.fillRect(b, 0, w - b, h);
+    const d = trimBuf.duration;
+    trimInfo.textContent = `${(tS.value / 1000 * d).toFixed(1)}s – ${(tE.value / 1000 * d).toFixed(1)}s  (of ${d.toFixed(1)}s)`;
+  }
+
+  tS.addEventListener('input', () => { if (+tS.value > +tE.value - MIN_GAP) tS.value = +tE.value - MIN_GAP; drawTrim(); });
+  tE.addEventListener('input', () => { if (+tE.value < +tS.value + MIN_GAP) tE.value = +tS.value + MIN_GAP; drawTrim(); });
+  // Play the trimmed part when you let go of a handle
+  [tS, tE].forEach(el => el.addEventListener('change', () => previewBtn.click()));
+  $('trimReset').addEventListener('click', () => { tS.value = 0; tE.value = 1000; drawTrim(); });
+
+  function currentTrim() {
+    if (!trimBuf || trimBox.hidden) {
+      return pending.sound ? { trimStart: null, trimEnd: null }
+        : { trimStart: current ? current.trimStart || null : null, trimEnd: current ? current.trimEnd || null : null };
+    }
+    const d = trimBuf.duration;
+    const s0 = +tS.value / 1000 * d, e0 = +tE.value / 1000 * d;
+    return { trimStart: s0 > 0.02 ? +s0.toFixed(3) : null, trimEnd: e0 < d - 0.02 ? +e0.toFixed(3) : null };
+  }
+
   soundBtn.addEventListener('click', () => soundInput.click());
   soundInput.addEventListener('change', () => { if (soundInput.files[0]) takeSound(soundInput.files[0]); });
   function takeSound(f, isRecording) {
@@ -504,6 +618,7 @@
     pending.sound = f;
     pending.soundName = f.name;
     soundName.textContent = f.name;
+    setupTrim(f, null, null);
     previewBtn.disabled = false;
     if (!isRecording && !labelInput.value.trim() && !current) {
       labelInput.value = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 40);
@@ -618,7 +733,7 @@
   previewBtn.addEventListener('click', () => {
     const src = pending.sound ? tempUrl(pending.sound) : (current && current.sound);
     if (!src) return;
-    playUrl(src, current ? vol(current) : 1, '__preview');
+    playUrl(src, current ? vol(current) : 1, '__preview', currentTrim());
   });
 
   $('cancelBtn').addEventListener('click', closeEditor);
@@ -652,6 +767,7 @@
         soundName: pending.soundName || (current && current.soundName) || '',
         volume: current ? vol(current) : 1,
         autoImage,
+        ...currentTrim(),
         label: labelInput.value.trim(),
       };
       await saveItems(item);
@@ -734,7 +850,7 @@
       range.addEventListener('input', () => { volDraft.set(item.id, range.value / 100); show(); });
       const test = document.createElement('button');
       test.type = 'button'; test.className = 'btn'; test.textContent = '▶';
-      test.addEventListener('click', () => playUrl(item.sound, volDraft.get(item.id), '__vol'));
+      test.addEventListener('click', () => playUrl(item.sound, volDraft.get(item.id), '__vol', item));
       show();
       ctl.append(range, test);
       row.append(name, pct, ctl);
@@ -760,6 +876,17 @@
     }
     btn.disabled = false; btn.textContent = 'Save'; busy = false;
     refresh(true);
+  });
+
+  // ---------- Tile size (saved on this device) ----------
+  const sizeRange = $('sizeRange');
+  let tile = 150;
+  try { tile = +localStorage.getItem('tileSize') || 150; } catch {}
+  const applySize = () => document.documentElement.style.setProperty('--tile', tile + 'px');
+  sizeRange.value = tile; applySize();
+  sizeRange.addEventListener('input', () => {
+    tile = +sizeRange.value; applySize();
+    try { localStorage.setItem('tileSize', tile); } catch {}
   });
 
   // ---------- Header ----------
