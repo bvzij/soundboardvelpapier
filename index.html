@@ -131,7 +131,7 @@
 <main id="grid"></main>
 <div id="empty" hidden>
   <p><strong>No buttons yet.</strong></p>
-  <p>Tap <strong>+ Add</strong>, pick a picture and a sound file.</p>
+  <p>Tap <strong>+ Add</strong>, pick a picture and a sound file (max 4 MB).</p>
 </div>
 
 <dialog id="dlg">
@@ -176,73 +176,73 @@
 
 <script>
 (() => {
-  // ---------- Storage (IndexedDB, on this device only) ----------
-  const DB_NAME = 'soundboard';
-  const STORE = 'buttons';
-  let db;
+  // ---------- Shared storage (Vercel Blob via /api) ----------
+  async function api(path, opts) {
+    const r = await fetch(path, opts);
+    let data = null;
+    try { data = await r.json(); } catch {}
+    if (!r.ok) throw new Error((data && data.error) || ('Error ' + r.status));
+    return data;
+  }
+  const fetchItems = () => api('/api/items', { cache: 'no-store' });
+  const saveItems = (...items) => api('/api/items', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items }),
+  });
+  const removeItem = id => api('/api/items?id=' + encodeURIComponent(id), { method: 'DELETE' });
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, 1);
-      req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: 'id' });
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+  const MAX_BYTES = 4.3 * 1024 * 1024;
+  const EXT_TYPES = { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav',
+    ogg: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac', webp: 'image/webp',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif' };
+  async function uploadFile(blob, name) {
+    if (blob.size > MAX_BYTES) throw new Error('File too big (max 4 MB)');
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const type = blob.type || EXT_TYPES[ext] || 'application/octet-stream';
+    const res = await api('/api/media?name=' + encodeURIComponent(name), {
+      method: 'POST', headers: { 'Content-Type': type }, body: blob,
     });
+    return res.url;
   }
-  function getAll() {
-    return new Promise((resolve, reject) => {
-      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  function write(fn) {
-    return new Promise((resolve, reject) => {
-      const t = db.transaction(STORE, 'readwrite');
-      fn(t.objectStore(STORE));
-      t.oncomplete = () => resolve();
-      t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error);
-    });
-  }
-  const putItems = (...list) => write(s => list.forEach(it => s.put(it)));
-  const deleteItem = id => write(s => s.delete(id));
 
   // ---------- Elements ----------
   const $ = id => document.getElementById(id);
   const grid = $('grid'), empty = $('empty'), dlg = $('dlg');
   const imgPick = $('imgPick'), imgPreview = $('imgPreview'), imgInput = $('imgInput');
   const soundBtn = $('soundBtn'), soundInput = $('soundInput'), soundName = $('soundName');
-  const previewBtn = $('previewBtn'), labelInput = $('labelInput');
+  const previewBtn = $('previewBtn'), labelInput = $('labelInput'), saveBtn = $('saveBtn');
 
   // ---------- State ----------
   let items = [];
+  let lastJson = '';
   let editing = false;
+  let busy = false;
   let playingId = null;
-  const urls = new Map(); // id -> { image, sound } object URLs
-
-  function urlFor(item, field) {
-    let entry = urls.get(item.id);
-    if (!entry) { entry = {}; urls.set(item.id, entry); }
-    if (!entry[field]) entry[field] = URL.createObjectURL(item[field]);
-    return entry[field];
-  }
-  function dropUrls(id) {
-    const entry = urls.get(id);
-    if (entry) Object.values(entry).forEach(u => URL.revokeObjectURL(u));
-    urls.delete(id);
-  }
 
   const newId = () => (crypto.randomUUID ? crypto.randomUUID()
     : Date.now().toString(36) + Math.random().toString(36).slice(2));
 
   let toastTimer;
-  function toast(msg) {
+  function toast(msg, ms = 2200) {
     const t = $('toast');
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+    toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+  }
+
+  // ---------- Sync ----------
+  async function refresh(force) {
+    if (busy || dlg.open) return;
+    try {
+      const list = await fetchItems();
+      const json = JSON.stringify(list);
+      if (!force && json === lastJson) return;
+      lastJson = json;
+      items = list;
+      render();
+    } catch (e) {
+      if (force) toast(e.message, 4000);
+    }
   }
 
   // ---------- Playback ----------
@@ -253,13 +253,13 @@
   function play(item) {
     if (playingId === item.id && !audio.paused) { stop(); return; }
     audio.pause();
-    audio.src = urlFor(item, 'sound');
+    audio.src = item.sound;
     audio.currentTime = 0;
     playingId = item.id;
     markPlaying();
     audio.play().catch(() => {
       playingId = null; markPlaying();
-      toast("This sound file can't be played");
+      toast("This sound can't be played");
     });
   }
   function stop() {
@@ -281,9 +281,10 @@
       tile.className = 'tile';
       tile.dataset.id = item.id;
       const img = document.createElement('img');
-      img.src = urlFor(item, 'image');
+      img.src = item.image;
       img.alt = item.label || '';
       img.draggable = false;
+      img.loading = 'lazy';
       tile.append(img);
       if (item.label) {
         const span = document.createElement('span');
@@ -317,20 +318,14 @@
 
   // ---------- Editor ----------
   let current = null;    // item being edited, or null for new
-  let pending = {};      // { image, sound, soundName }
-  let previewUrl = null;
+  let pending = {};      // { image: Blob, imageName, sound: Blob, soundName }
+  const localUrls = [];
   const previewAudio = new Audio();
+  const tempUrl = blob => { const u = URL.createObjectURL(blob); localUrls.push(u); return u; };
 
-  function setImagePreview(blob) {
-    if (imgPreview.dataset.url) URL.revokeObjectURL(imgPreview.dataset.url);
-    if (blob) {
-      const u = URL.createObjectURL(blob);
-      imgPreview.src = u; imgPreview.dataset.url = u;
-      imgPick.classList.add('has');
-    } else {
-      imgPreview.removeAttribute('src'); delete imgPreview.dataset.url;
-      imgPick.classList.remove('has');
-    }
+  function setImagePreview(src) {
+    if (src) { imgPreview.src = src; imgPick.classList.add('has'); }
+    else { imgPreview.removeAttribute('src'); imgPick.classList.remove('has'); }
   }
 
   function openEditor(item) {
@@ -349,17 +344,32 @@
       $('moveRight').disabled = i >= items.length - 1;
     }
     imgInput.value = ''; soundInput.value = '';
+    setBusy(false);
     dlg.showModal();
   }
 
   function closeEditor() {
     previewAudio.pause();
-    if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+    localUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
     setImagePreview(null);
     dlg.close();
   }
 
-  // Shrink big photos so storage stays small and the grid stays fast
+  function setBusy(on, label) {
+    busy = on;
+    dlg.querySelectorAll('button').forEach(b => { b.disabled = on || b.dataset.off === '1'; });
+    saveBtn.textContent = on ? (label || 'Saving…') : 'Save';
+    if (!on) {
+      previewBtn.disabled = !(pending.sound || current);
+      if (current) {
+        const i = items.indexOf(current);
+        $('moveLeft').disabled = i <= 0;
+        $('moveRight').disabled = i >= items.length - 1;
+      }
+    }
+  }
+
+  // Shrink big photos so uploads stay small and the grid stays fast
   async function shrinkImage(file, max = 640) {
     try {
       const bmp = await createImageBitmap(file);
@@ -380,13 +390,15 @@
     const f = imgInput.files[0];
     if (!f) return;
     pending.image = await shrinkImage(f);
-    setImagePreview(pending.image);
+    pending.imageName = f.name.replace(/\.[^.]+$/, '') + (pending.image.type === 'image/webp' ? '.webp' : '');
+    setImagePreview(tempUrl(pending.image));
   });
 
   soundBtn.addEventListener('click', () => soundInput.click());
   soundInput.addEventListener('change', () => {
     const f = soundInput.files[0];
     if (!f) return;
+    if (f.size > MAX_BYTES) { toast('Sound too big (max 4 MB)'); soundInput.value = ''; return; }
     pending.sound = f;
     pending.soundName = f.name;
     soundName.textContent = f.name;
@@ -397,39 +409,43 @@
   });
 
   previewBtn.addEventListener('click', () => {
-    const blob = pending.sound || (current && current.sound);
-    if (!blob) return;
+    const src = pending.sound ? tempUrl(pending.sound) : (current && current.sound);
+    if (!src) return;
     if (!previewAudio.paused) { previewAudio.pause(); return; }
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(blob);
-    previewAudio.src = previewUrl;
-    previewAudio.play().catch(() => toast("This sound file can't be played"));
+    previewAudio.src = src;
+    previewAudio.play().catch(() => toast("This sound can't be played"));
   });
 
   $('cancelBtn').addEventListener('click', closeEditor);
 
-  $('saveBtn').addEventListener('click', async () => {
-    const image = pending.image || (current && current.image);
-    const sound = pending.sound || (current && current.sound);
-    if (!image) { toast('Choose a picture first'); return; }
-    if (!sound) { toast('Choose a sound first'); return; }
-    const item = current
-      ? Object.assign(current, { image, sound, soundName: pending.soundName || current.soundName })
-      : { id: newId(), image, sound, soundName: pending.soundName,
-          order: items.length ? Math.max(...items.map(i => i.order)) + 1 : 0 };
-    item.label = labelInput.value.trim();
+  saveBtn.addEventListener('click', async () => {
+    if (!pending.image && !(current && current.image)) { toast('Choose a picture first'); return; }
+    if (!pending.sound && !(current && current.sound)) { toast('Choose a sound first'); return; }
+    setBusy(true, 'Uploading…');
     try {
-      await putItems(item);
+      const [image, sound] = await Promise.all([
+        pending.image ? uploadFile(pending.image, pending.imageName || 'picture') : current.image,
+        pending.sound ? uploadFile(pending.sound, pending.soundName) : current.sound,
+      ]);
+      setBusy(true, 'Saving…');
+      const item = {
+        id: current ? current.id : newId(),
+        order: current ? current.order : (items.length ? Math.max(...items.map(i => i.order)) + 1 : 0),
+        image, sound,
+        soundName: pending.soundName || (current && current.soundName) || '',
+        label: labelInput.value.trim(),
+      };
+      await saveItems(item);
+      if (current) Object.assign(current, item); else items.push(item);
+      setBusy(false);
+      closeEditor();
+      render();
+      toast('Saved');
+      refresh(true);
     } catch (e) {
-      toast('Could not save — storage may be full');
-      return;
+      setBusy(false);
+      toast(e.message, 4000);
     }
-    dropUrls(item.id);
-    if (!current) items.push(item);
-    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
-    closeEditor();
-    render();
-    toast('Saved');
   });
 
   async function move(dir) {
@@ -438,22 +454,40 @@
     if (!current || j < 0 || j >= items.length) return;
     const other = items[j];
     [current.order, other.order] = [other.order, current.order];
-    await putItems(current, other);
+    setBusy(true);
+    try {
+      await saveItems(current, other);
+    } catch (e) {
+      [current.order, other.order] = [other.order, current.order];
+      setBusy(false);
+      toast(e.message, 4000);
+      return;
+    }
+    setBusy(false);
     closeEditor();
     render();
+    refresh(true);
   }
   $('moveLeft').addEventListener('click', () => move(-1));
   $('moveRight').addEventListener('click', () => move(1));
 
   $('deleteBtn').addEventListener('click', async () => {
     if (!current) return;
-    if (!confirm('Delete this button?')) return;
-    await deleteItem(current.id);
-    dropUrls(current.id);
+    if (!confirm('Delete this button for everyone?')) return;
+    setBusy(true, 'Deleting…');
+    try {
+      await removeItem(current.id);
+    } catch (e) {
+      setBusy(false);
+      toast(e.message, 4000);
+      return;
+    }
     items = items.filter(i => i !== current);
+    setBusy(false);
     closeEditor();
     render();
     toast('Deleted');
+    refresh(true);
   });
 
   // ---------- Header ----------
@@ -461,11 +495,11 @@
   $('editBtn').addEventListener('click', () => { editing = !editing; stop(); render(); });
   $('stopBtn').addEventListener('click', stop);
 
-  // ---------- Start ----------
-  openDB()
-    .then(d => { db = d; return getAll(); })
-    .then(list => { items = list; render(); })
-    .catch(() => toast('Storage is not available in this browser'));
+  // ---------- Start + keep in sync ----------
+  render();
+  refresh(true);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  setInterval(() => { if (!document.hidden) refresh(); }, 20000);
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
