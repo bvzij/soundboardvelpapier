@@ -284,7 +284,32 @@
   // Web Audio: instant restart on every tap + volume above 100%.
   // Falls back to a plain <audio> element if a file can't be decoded.
   let ctx = null;
-  const buffers = new Map();   // sound url -> Promise<AudioBuffer|null>
+  const buffers = new Map();   // sound url -> Promise<{ buf, norm }|null>
+  let limiter = null;
+
+  // Auto-level: boost quiet sounds (e.g. mic recordings) so their loudest
+  // point sits near full scale. Capped so silence/noise isn't blown up.
+  function normGain(buf) {
+    let peak = 0;
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < d.length; i++) { const v = d[i] < 0 ? -d[i] : d[i]; if (v > peak) peak = v; }
+    }
+    return peak > 0.0001 ? Math.min(10, 0.95 / peak) : 1;
+  }
+  // Limiter: lets the slider go far above 100% (much louder) without harsh distortion
+  function output(c) {
+    if (!limiter) {
+      limiter = c.createDynamicsCompressor();
+      limiter.threshold.value = -3;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.002;
+      limiter.release.value = 0.15;
+      limiter.connect(c.destination);
+    }
+    return limiter;
+  }
   let current_src = null;      // { stop() }
   const fallback = new Audio();
   fallback.addEventListener('ended', () => { playingId = null; markPlaying(); });
@@ -299,6 +324,7 @@
       buffers.set(url, fetch(url)
         .then(r => { if (!r.ok) throw 0; return r.arrayBuffer(); })
         .then(b => audioCtx().decodeAudioData(b))
+        .then(buf => ({ buf, norm: normGain(buf) }))
         .catch(() => null));
     }
     return buffers.get(url);
@@ -315,14 +341,14 @@
     playingId = id;
     markPlaying();
     const c = audioCtx();
-    const buf = await loadBuffer(url);
+    const loaded = await loadBuffer(url);
     if (playingId !== id) return;           // another tap happened meanwhile
-    if (buf) {
+    if (loaded) {
       const src = c.createBufferSource();
       const gain = c.createGain();
-      gain.gain.value = volume;
-      src.buffer = buf;
-      src.connect(gain).connect(c.destination);
+      gain.gain.value = loaded.norm * volume;
+      src.buffer = loaded.buf;
+      src.connect(gain).connect(output(c));
       src.onended = () => { if (current_src === src) { current_src = null; playingId = null; markPlaying(); } };
       stopSource();
       current_src = src;
@@ -500,7 +526,7 @@
     stop();
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
     } catch {
       toast('Microphone not allowed — check the browser permission', 4000);
       return;
@@ -702,7 +728,7 @@
       const ctl = document.createElement('div');
       ctl.className = 'vctl';
       const range = document.createElement('input');
-      range.type = 'range'; range.min = 0; range.max = 200; range.step = 5;
+      range.type = 'range'; range.min = 0; range.max = 400; range.step = 10;
       range.value = Math.round(vol(item) * 100);
       const show = () => { pct.textContent = range.value + '%'; };
       range.addEventListener('input', () => { volDraft.set(item.id, range.value / 100); show(); });
