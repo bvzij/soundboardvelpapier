@@ -108,8 +108,26 @@
   #editExtras { display: none; }
   #editExtras.show { display: flex; }
 
+  #stopFab {
+    position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom));
+    transform: translateX(-50%); z-index: 10;
+    border: 0; border-radius: 999px; padding: 12px 26px; min-height: 48px;
+    background: var(--danger); color: #fff; font-weight: 700;
+    box-shadow: 0 6px 20px rgba(0,0,0,.45);
+  }
+  #grid { padding-bottom: 100px; }
+  dialog.drag { outline: 3px dashed var(--accent); outline-offset: -8px; }
+  .drophint { color: var(--muted); font-size: 13px; text-align: center; margin: 10px 0 0; }
+  .vrow { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center;
+    padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .vrow .vname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+  .vrow .vpct { color: var(--muted); font-size: 14px; min-width: 48px; text-align: right; }
+  .vrow .vctl { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center; }
+  .vrow input[type=range] { flex: 1; accent-color: var(--accent); height: 32px; }
+  .vrow .btn { padding: 6px 12px; min-height: 36px; }
+  #volList { max-height: 60vh; overflow-y: auto; }
   #toast {
-    position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
+    position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom));
     transform: translateX(-50%) translateY(20px); opacity: 0; pointer-events: none;
     background: var(--text); color: var(--bg); padding: 10px 18px; border-radius: 999px;
     font-weight: 600; transition: all .2s ease; z-index: 20; max-width: 90vw; text-align: center;
@@ -122,7 +140,7 @@
 <header>
   <h1>Soundboard</h1>
   <div class="actions">
-    <button class="btn" id="stopBtn" aria-label="Stop sound">■ Stop</button>
+    <button class="btn" id="volBtn" aria-label="Volume settings">⚙ Volume</button>
     <button class="btn" id="editBtn">Edit</button>
     <button class="btn primary" id="addBtn">+ Add</button>
   </div>
@@ -158,6 +176,8 @@
     <input type="text" id="labelInput" maxlength="40" placeholder="e.g. Applause">
   </div>
 
+  <p class="drophint">Tip: you can also drag &amp; drop a picture and a sound here.</p>
+
   <div class="row" id="editExtras">
     <button type="button" class="btn" id="moveLeft">← Move</button>
     <button type="button" class="btn" id="moveRight">Move →</button>
@@ -172,6 +192,17 @@
   </div>
 </dialog>
 
+<dialog id="volDlg">
+  <h2>Volume per sound</h2>
+  <div id="volList"></div>
+  <div class="row">
+    <span class="grow"></span>
+    <button type="button" class="btn" id="volCancel">Cancel</button>
+    <button type="button" class="btn primary" id="volSave">Save</button>
+  </div>
+</dialog>
+
+<button id="stopFab" aria-label="Stop sound">■ Stop</button>
 <div id="toast"></div>
 
 <script>
@@ -232,7 +263,7 @@
 
   // ---------- Sync ----------
   async function refresh(force) {
-    if (busy || dlg.open) return;
+    if (busy || dlg.open || (typeof volDlg !== 'undefined' && volDlg.open)) return;
     try {
       const list = await fetchItems();
       const json = JSON.stringify(list);
@@ -240,30 +271,72 @@
       lastJson = json;
       items = list;
       render();
+      if (ctx) preloadAll();
     } catch (e) {
       if (force) toast(e.message, 4000);
     }
   }
 
   // ---------- Playback ----------
-  const audio = new Audio();
-  audio.preload = 'auto';
-  audio.addEventListener('ended', () => { playingId = null; markPlaying(); });
+  // Web Audio: instant restart on every tap + volume above 100%.
+  // Falls back to a plain <audio> element if a file can't be decoded.
+  let ctx = null;
+  const buffers = new Map();   // sound url -> Promise<AudioBuffer|null>
+  let current_src = null;      // { stop() }
+  const fallback = new Audio();
+  fallback.addEventListener('ended', () => { playingId = null; markPlaying(); });
 
-  function play(item) {
-    if (playingId === item.id && !audio.paused) { stop(); return; }
-    audio.pause();
-    audio.src = item.sound;
-    audio.currentTime = 0;
-    playingId = item.id;
-    markPlaying();
-    audio.play().catch(() => {
-      playingId = null; markPlaying();
-      toast("This sound can't be played");
-    });
+  function audioCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
   }
+  function loadBuffer(url) {
+    if (!buffers.has(url)) {
+      buffers.set(url, fetch(url)
+        .then(r => { if (!r.ok) throw 0; return r.arrayBuffer(); })
+        .then(b => audioCtx().decodeAudioData(b))
+        .catch(() => null));
+    }
+    return buffers.get(url);
+  }
+  const vol = item => (Number.isFinite(item.volume) ? item.volume : 1);
+
+  function stopSource() {
+    if (current_src) { try { current_src.stop(); } catch {} current_src = null; }
+    fallback.pause();
+  }
+
+  async function playUrl(url, volume, id) {
+    stopSource();
+    playingId = id;
+    markPlaying();
+    const c = audioCtx();
+    const buf = await loadBuffer(url);
+    if (playingId !== id) return;           // another tap happened meanwhile
+    if (buf) {
+      const src = c.createBufferSource();
+      const gain = c.createGain();
+      gain.gain.value = volume;
+      src.buffer = buf;
+      src.connect(gain).connect(c.destination);
+      src.onended = () => { if (current_src === src) { current_src = null; playingId = null; markPlaying(); } };
+      stopSource();
+      current_src = src;
+      src.start();
+    } else {
+      fallback.src = url;
+      fallback.volume = Math.min(1, volume);
+      fallback.currentTime = 0;
+      fallback.play().catch(() => { playingId = null; markPlaying(); toast("This sound can't be played"); });
+    }
+  }
+
+  // Every tap restarts the sound from the beginning
+  const play = item => playUrl(item.sound, vol(item), item.id);
+
   function stop() {
-    audio.pause();
+    stopSource();
     playingId = null;
     markPlaying();
   }
@@ -271,6 +344,7 @@
     grid.querySelectorAll('.tile').forEach(t =>
       t.classList.toggle('playing', t.dataset.id === playingId));
   }
+  function preloadAll() { items.forEach(i => i.sound && loadBuffer(i.sound)); }
 
   // ---------- Grid ----------
   function render() {
@@ -349,7 +423,7 @@
   }
 
   function closeEditor() {
-    previewAudio.pause();
+    stop();
     localUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
     setImagePreview(null);
     dlg.close();
@@ -386,18 +460,16 @@
   }
 
   imgPick.addEventListener('click', () => imgInput.click());
-  imgInput.addEventListener('change', async () => {
-    const f = imgInput.files[0];
-    if (!f) return;
+  async function takeImage(f) {
     pending.image = await shrinkImage(f);
     pending.imageName = f.name.replace(/\.[^.]+$/, '') + (pending.image.type === 'image/webp' ? '.webp' : '');
     setImagePreview(tempUrl(pending.image));
-  });
+  }
+  imgInput.addEventListener('change', () => { if (imgInput.files[0]) takeImage(imgInput.files[0]); });
 
   soundBtn.addEventListener('click', () => soundInput.click());
-  soundInput.addEventListener('change', () => {
-    const f = soundInput.files[0];
-    if (!f) return;
+  soundInput.addEventListener('change', () => { if (soundInput.files[0]) takeSound(soundInput.files[0]); });
+  function takeSound(f) {
     if (f.size > MAX_BYTES) { toast('Sound too big (max 4 MB)'); soundInput.value = ''; return; }
     pending.sound = f;
     pending.soundName = f.name;
@@ -406,14 +478,41 @@
     if (!labelInput.value.trim() && !current) {
       labelInput.value = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 40);
     }
+ }
+
+  // Drag & drop pictures and sounds onto the dialog
+  const isAudio = f => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|wav|ogg|opus|flac)$/i.test(f.name);
+  const isImage = f => /^image\//.test(f.type);
+  ['dragenter', 'dragover'].forEach(e => dlg.addEventListener(e, ev => {
+    ev.preventDefault(); dlg.classList.add('drag');
+  }));
+  ['dragleave', 'drop'].forEach(e => dlg.addEventListener(e, ev => {
+    if (e === 'dragleave' && dlg.contains(ev.relatedTarget)) return;
+    dlg.classList.remove('drag');
+  }));
+  dlg.addEventListener('drop', ev => {
+    ev.preventDefault();
+    if (busy) return;
+    for (const f of ev.dataTransfer.files) {
+      if (isImage(f)) takeImage(f);
+      else if (isAudio(f)) takeSound(f);
+    }
+  });
+  // Dropping files anywhere on the page opens the "new button" dialog
+  document.addEventListener('dragover', ev => { if (!dlg.open && !volDlg.open) ev.preventDefault(); });
+  document.addEventListener('drop', ev => {
+    if (dlg.open || volDlg.open) return;
+    ev.preventDefault();
+    const files = [...ev.dataTransfer.files];
+    if (!files.length) return;
+    openEditor(null);
+    files.forEach(f => { if (isImage(f)) takeImage(f); else if (isAudio(f)) takeSound(f); });
   });
 
   previewBtn.addEventListener('click', () => {
     const src = pending.sound ? tempUrl(pending.sound) : (current && current.sound);
     if (!src) return;
-    if (!previewAudio.paused) { previewAudio.pause(); return; }
-    previewAudio.src = src;
-    previewAudio.play().catch(() => toast("This sound can't be played"));
+    playUrl(src, current ? vol(current) : 1, '__preview');
   });
 
   $('cancelBtn').addEventListener('click', closeEditor);
@@ -433,6 +532,7 @@
         order: current ? current.order : (items.length ? Math.max(...items.map(i => i.order)) + 1 : 0),
         image, sound,
         soundName: pending.soundName || (current && current.soundName) || '',
+        volume: current ? vol(current) : 1,
         label: labelInput.value.trim(),
       };
       await saveItems(item);
@@ -490,10 +590,66 @@
     refresh(true);
   });
 
+  // ---------- Volume settings ----------
+  const volDlg = $('volDlg'), volList = $('volList');
+  let volDraft = new Map();
+  function openVolume() {
+    stop();
+    if (!items.length) { toast('Add a button first'); return; }
+    volDraft = new Map(items.map(i => [i.id, vol(i)]));
+    volList.innerHTML = '';
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'vrow';
+      const name = document.createElement('div');
+      name.className = 'vname';
+      name.textContent = item.label || item.soundName || 'Sound';
+      const pct = document.createElement('div');
+      pct.className = 'vpct';
+      const ctl = document.createElement('div');
+      ctl.className = 'vctl';
+      const range = document.createElement('input');
+      range.type = 'range'; range.min = 0; range.max = 200; range.step = 5;
+      range.value = Math.round(vol(item) * 100);
+      const show = () => { pct.textContent = range.value + '%'; };
+      range.addEventListener('input', () => { volDraft.set(item.id, range.value / 100); show(); });
+      const test = document.createElement('button');
+      test.type = 'button'; test.className = 'btn'; test.textContent = '▶';
+      test.addEventListener('click', () => playUrl(item.sound, volDraft.get(item.id), '__vol'));
+      show();
+      ctl.append(range, test);
+      row.append(name, pct, ctl);
+      volList.append(row);
+    }
+    volDlg.showModal();
+  }
+  function closeVolume() { stop(); volDlg.close(); }
+  $('volCancel').addEventListener('click', closeVolume);
+  $('volSave').addEventListener('click', async () => {
+    const changed = items.filter(i => Math.abs(vol(i) - volDraft.get(i.id)) > 0.001)
+      .map(i => ({ ...i, volume: volDraft.get(i.id) }));
+    if (!changed.length) { closeVolume(); return; }
+    const btn = $('volSave');
+    btn.disabled = true; btn.textContent = 'Saving…'; busy = true;
+    try {
+      await saveItems(...changed);
+      changed.forEach(c => Object.assign(items.find(i => i.id === c.id), { volume: c.volume }));
+      closeVolume();
+      toast('Volume saved');
+    } catch (e) {
+      toast(e.message, 4000);
+    }
+    btn.disabled = false; btn.textContent = 'Save'; busy = false;
+    refresh(true);
+  });
+
   // ---------- Header ----------
   $('addBtn').addEventListener('click', () => openEditor(null));
   $('editBtn').addEventListener('click', () => { editing = !editing; stop(); render(); });
-  $('stopBtn').addEventListener('click', stop);
+  $('stopFab').addEventListener('click', stop);
+  $('volBtn').addEventListener('click', openVolume);
+  // Warm up audio on the first touch so the first tap plays instantly
+  document.addEventListener('pointerdown', () => { if (!ctx) { audioCtx(); preloadAll(); } }, { once: true });
 
   // ---------- Start + keep in sync ----------
   render();
